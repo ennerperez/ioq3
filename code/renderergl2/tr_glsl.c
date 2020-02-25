@@ -146,6 +146,10 @@ static uniformInfo_t uniformsInfo[] =
 	{ "u_PrimaryLightRadius",  GLSL_FLOAT },
 
 	{ "u_CubeMapInfo", GLSL_VEC4 },
+
+	{ "u_AlphaTest", GLSL_INT },
+
+	{ "u_BoneMatrix", GLSL_MAT16_BONEMATRIX },
 };
 
 typedef enum
@@ -239,7 +243,10 @@ static void GLSL_GetShaderHeader( GLenum shaderType, const GLchar *extra, char *
 	// HACK: abuse the GLSL preprocessor to turn GLSL 1.20 shaders into 1.30 ones
 	if(glRefConfig.glslMajorVersion > 1 || (glRefConfig.glslMajorVersion == 1 && glRefConfig.glslMinorVersion >= 30))
 	{
-		Q_strcat(dest, size, "#version 130\n");
+		if (glRefConfig.glslMajorVersion > 1 || (glRefConfig.glslMajorVersion == 1 && glRefConfig.glslMinorVersion >= 50))
+			Q_strcat(dest, size, "#version 150\n");
+		else
+			Q_strcat(dest, size, "#version 130\n");
 
 		if(shaderType == GL_VERTEX_SHADER)
 		{
@@ -252,11 +259,15 @@ static void GLSL_GetShaderHeader( GLenum shaderType, const GLchar *extra, char *
 
 			Q_strcat(dest, size, "out vec4 out_Color;\n");
 			Q_strcat(dest, size, "#define gl_FragColor out_Color\n");
+			Q_strcat(dest, size, "#define texture2D texture\n");
+			Q_strcat(dest, size, "#define textureCubeLod textureLod\n");
+			Q_strcat(dest, size, "#define shadow2D texture\n");
 		}
 	}
 	else
 	{
 		Q_strcat(dest, size, "#version 120\n");
+		Q_strcat(dest, size, "#define shadow2D(a,b) shadow2D(a,b).r \n");
 	}
 
 	// HACK: add some macros to avoid extra uniforms and save speed and code maintenance
@@ -321,17 +332,6 @@ static void GLSL_GetShaderHeader( GLenum shaderType, const GLchar *extra, char *
 								"#endif\n",
 								AGEN_LIGHTING_SPECULAR,
 								AGEN_PORTAL));
-
-	Q_strcat(dest, size,
-							 va("#ifndef texenv_t\n"
-								"#define texenv_t\n"
-								"#define TEXENV_MODULATE %i\n"
-								"#define TEXENV_ADD %i\n"
-								"#define TEXENV_REPLACE %i\n"
-								"#endif\n",
-								GL_MODULATE,
-								GL_ADD,
-								GL_REPLACE));
 
 	fbufWidthScale = 1.0f / ((float)glConfig.vidWidth);
 	fbufHeightScale = 1.0f / ((float)glConfig.vidHeight);
@@ -478,20 +478,6 @@ static void GLSL_LinkProgram(GLuint program)
 	}
 }
 
-static void GLSL_ValidateProgram(GLuint program)
-{
-	GLint           validated;
-
-	qglValidateProgram(program);
-
-	qglGetProgramiv(program, GL_VALIDATE_STATUS, &validated);
-	if(!validated)
-	{
-		GLSL_PrintLog(program, GLSL_PRINTLOG_PROGRAM_INFO, qfalse);
-		ri.Error(ERR_DROP, "shaders failed to validate");
-	}
-}
-
 static void GLSL_ShowProgramUniforms(GLuint program)
 {
 	int             i, count, size;
@@ -570,6 +556,12 @@ static int GLSL_InitGPUShader2(shaderProgram_t * program, const char *name, int 
 
 	if(attribs & ATTR_LIGHTDIRECTION)
 		qglBindAttribLocation(program->program, ATTR_INDEX_LIGHTDIRECTION, "attr_LightDirection");
+
+	if(attribs & ATTR_BONE_INDEXES)
+		qglBindAttribLocation(program->program, ATTR_INDEX_BONE_INDEXES, "attr_BoneIndexes");
+
+	if(attribs & ATTR_BONE_WEIGHTS)
+		qglBindAttribLocation(program->program, ATTR_INDEX_BONE_WEIGHTS, "attr_BoneWeights");
 
 	if(attribs & ATTR_POSITION2)
 		qglBindAttribLocation(program->program, ATTR_INDEX_POSITION2, "attr_Position2");
@@ -676,6 +668,9 @@ void GLSL_InitUniforms(shaderProgram_t *program)
 			case GLSL_MAT16:
 				size += sizeof(vec_t) * 16;
 				break;
+			case GLSL_MAT16_BONEMATRIX:
+				size += sizeof(vec_t) * 16 * glRefConfig.glslMaxAnimatedBones;
+				break;
 			default:
 				break;
 		}
@@ -686,7 +681,6 @@ void GLSL_InitUniforms(shaderProgram_t *program)
 
 void GLSL_FinishGPUShader(shaderProgram_t *program)
 {
-	GLSL_ValidateProgram(program->program);
 	GLSL_ShowProgramUniforms(program->program);
 	GL_CheckErrors();
 }
@@ -860,6 +854,38 @@ void GLSL_SetUniformMat4(shaderProgram_t *program, int uniformNum, const mat4_t 
 	qglProgramUniformMatrix4fvEXT(program->program, uniforms[uniformNum], 1, GL_FALSE, matrix);
 }
 
+void GLSL_SetUniformMat4BoneMatrix(shaderProgram_t *program, int uniformNum, /*const*/ mat4_t *matrix, int numMatricies)
+{
+	GLint *uniforms = program->uniforms;
+	vec_t *compare = (float *)(program->uniformBuffer + program->uniformBufferOffsets[uniformNum]);
+
+	if (uniforms[uniformNum] == -1) {
+		return;
+	}
+
+	if (uniformsInfo[uniformNum].type != GLSL_MAT16_BONEMATRIX)
+	{
+		ri.Printf( PRINT_WARNING, "GLSL_SetUniformMat4BoneMatrix: wrong type for uniform %i in program %s\n", uniformNum, program->name);
+		return;
+	}
+
+	if (numMatricies > glRefConfig.glslMaxAnimatedBones)
+	{
+		ri.Printf( PRINT_WARNING, "GLSL_SetUniformMat4BoneMatrix: too many matricies (%d/%d) for uniform %i in program %s\n",
+				numMatricies, glRefConfig.glslMaxAnimatedBones, uniformNum, program->name);
+		return;
+	}
+
+	if (!memcmp(matrix, compare, numMatricies * sizeof(mat4_t)))
+	{
+		return;
+	}
+
+	Com_Memcpy(compare, matrix, numMatricies * sizeof(mat4_t));
+
+	qglProgramUniformMatrix4fvEXT(program->program, uniforms[uniformNum], numMatricies, GL_FALSE, &matrix[0][0]);
+}
+
 void GLSL_DeleteGPUShader(shaderProgram_t *program)
 {
 	if(program->program)
@@ -903,6 +929,12 @@ void GLSL_InitGPUShaders(void)
 
 	for (i = 0; i < GENERICDEF_COUNT; i++)
 	{	
+		if ((i & GENERICDEF_USE_VERTEX_ANIMATION) && (i & GENERICDEF_USE_BONE_ANIMATION))
+			continue;
+
+		if ((i & GENERICDEF_USE_BONE_ANIMATION) && !glRefConfig.glslMaxAnimatedBones)
+			continue;
+
 		attribs = ATTR_POSITION | ATTR_TEXCOORD | ATTR_LIGHTCOORD | ATTR_NORMAL | ATTR_COLOR;
 		extradefines[0] = '\0';
 
@@ -919,6 +951,11 @@ void GLSL_InitGPUShaders(void)
 		{
 			Q_strcat(extradefines, 1024, "#define USE_VERTEX_ANIMATION\n");
 			attribs |= ATTR_POSITION2 | ATTR_NORMAL2;
+		}
+		else if (i & GENERICDEF_USE_BONE_ANIMATION)
+		{
+			Q_strcat(extradefines, 1024, va("#define USE_BONE_ANIMATION\n#define MAX_GLSL_BONES %d\n", glRefConfig.glslMaxAnimatedBones));
+			attribs |= ATTR_BONE_INDEXES | ATTR_BONE_WEIGHTS;
 		}
 
 		if (i & GENERICDEF_USE_FOG)
@@ -945,7 +982,7 @@ void GLSL_InitGPUShaders(void)
 
 	attribs = ATTR_POSITION | ATTR_TEXCOORD;
 
-	if (!GLSL_InitGPUShader(&tr.textureColorShader, "texturecolor", attribs, qtrue, NULL, qfalse, fallbackShader_texturecolor_vp, fallbackShader_texturecolor_fp))
+	if (!GLSL_InitGPUShader(&tr.textureColorShader, "texturecolor", attribs, qtrue, extradefines, qtrue, fallbackShader_texturecolor_vp, fallbackShader_texturecolor_fp))
 	{
 		ri.Error(ERR_FATAL, "Could not load texturecolor shader!");
 	}
@@ -960,14 +997,28 @@ void GLSL_InitGPUShaders(void)
 
 	for (i = 0; i < FOGDEF_COUNT; i++)
 	{
-		attribs = ATTR_POSITION | ATTR_POSITION2 | ATTR_NORMAL | ATTR_NORMAL2 | ATTR_TEXCOORD;
+		if ((i & FOGDEF_USE_VERTEX_ANIMATION) && (i & FOGDEF_USE_BONE_ANIMATION))
+			continue;
+
+		if ((i & FOGDEF_USE_BONE_ANIMATION) && !glRefConfig.glslMaxAnimatedBones)
+			continue;
+
+		attribs = ATTR_POSITION | ATTR_NORMAL | ATTR_TEXCOORD;
 		extradefines[0] = '\0';
 
 		if (i & FOGDEF_USE_DEFORM_VERTEXES)
 			Q_strcat(extradefines, 1024, "#define USE_DEFORM_VERTEXES\n");
 
 		if (i & FOGDEF_USE_VERTEX_ANIMATION)
+		{
 			Q_strcat(extradefines, 1024, "#define USE_VERTEX_ANIMATION\n");
+			attribs |= ATTR_POSITION2 | ATTR_NORMAL2;
+		}
+		else if (i & FOGDEF_USE_BONE_ANIMATION)
+		{
+			Q_strcat(extradefines, 1024, va("#define USE_BONE_ANIMATION\n#define MAX_GLSL_BONES %d\n", glRefConfig.glslMaxAnimatedBones));
+			attribs |= ATTR_BONE_INDEXES | ATTR_BONE_WEIGHTS;
+		}
 
 		if (!GLSL_InitGPUShader(&tr.fogShader[i], "fogpass", attribs, qtrue, extradefines, qtrue, fallbackShader_fogpass_vp, fallbackShader_fogpass_fp))
 		{
@@ -1015,7 +1066,13 @@ void GLSL_InitGPUShaders(void)
 		if ((i & LIGHTDEF_USE_PARALLAXMAP) && !r_parallaxMapping->integer)
 			continue;
 
-		if (!lightType && (i & LIGHTDEF_USE_SHADOWMAP))
+		if ((i & LIGHTDEF_USE_SHADOWMAP) && (!lightType || !r_sunlightMode->integer))
+			continue;
+
+		if ((i & LIGHTDEF_ENTITY_VERTEX_ANIMATION) && (i & LIGHTDEF_ENTITY_BONE_ANIMATION))
+			continue;
+
+		if ((i & LIGHTDEF_ENTITY_BONE_ANIMATION) && !glRefConfig.glslMaxAnimatedBones)
 			continue;
 
 		attribs = ATTR_POSITION | ATTR_TEXCOORD | ATTR_COLOR | ATTR_NORMAL;
@@ -1060,11 +1117,14 @@ void GLSL_InitGPUShaders(void)
 
 				attribs |= ATTR_TANGENT;
 
-				if ((i & LIGHTDEF_USE_PARALLAXMAP) && !(i & LIGHTDEF_ENTITY) && r_parallaxMapping->integer)
+				if ((i & LIGHTDEF_USE_PARALLAXMAP) && !(i & LIGHTDEF_ENTITY_VERTEX_ANIMATION) && !(i & LIGHTDEF_ENTITY_BONE_ANIMATION) && r_parallaxMapping->integer)
 				{
 					Q_strcat(extradefines, 1024, "#define USE_PARALLAXMAP\n");
 					if (r_parallaxMapping->integer > 1)
 						Q_strcat(extradefines, 1024, "#define USE_RELIEFMAP\n");
+
+					if (r_parallaxMapShadows->integer)
+						Q_strcat(extradefines, 1024, "#define USE_PARALLAXMAP_SHADOWS\n");
 				}
 			}
 
@@ -1072,7 +1132,15 @@ void GLSL_InitGPUShaders(void)
 				Q_strcat(extradefines, 1024, "#define USE_SPECULARMAP\n");
 
 			if (r_cubeMapping->integer)
+			{
 				Q_strcat(extradefines, 1024, "#define USE_CUBEMAP\n");
+				if (r_cubeMapping->integer == 2)
+					Q_strcat(extradefines, 1024, "#define USE_BOX_CUBEMAP_PARALLAX\n");
+			}
+			else if (r_deluxeSpecular->value > 0.000001f)
+			{
+				Q_strcat(extradefines, 1024, va("#define r_deluxeSpecular %f\n", r_deluxeSpecular->value));
+			}
 
 			switch (r_glossType->integer)
 			{
@@ -1108,7 +1176,7 @@ void GLSL_InitGPUShaders(void)
 			Q_strcat(extradefines, 1024, "#define USE_TCMOD\n");
 		}
 
-		if (i & LIGHTDEF_ENTITY)
+		if (i & LIGHTDEF_ENTITY_VERTEX_ANIMATION)
 		{
 			Q_strcat(extradefines, 1024, "#define USE_VERTEX_ANIMATION\n#define USE_MODELMATRIX\n");
 			attribs |= ATTR_POSITION2 | ATTR_NORMAL2;
@@ -1117,6 +1185,12 @@ void GLSL_InitGPUShaders(void)
 			{
 				attribs |= ATTR_TANGENT2;
 			}
+		}
+		else if (i & LIGHTDEF_ENTITY_BONE_ANIMATION)
+		{
+			Q_strcat(extradefines, 1024, "#define USE_MODELMATRIX\n");
+			Q_strcat(extradefines, 1024, va("#define USE_BONE_ANIMATION\n#define MAX_GLSL_BONES %d\n", glRefConfig.glslMaxAnimatedBones));
+			attribs |= ATTR_BONE_INDEXES | ATTR_BONE_WEIGHTS;
 		}
 
 		if (!GLSL_InitGPUShader(&tr.lightallShader[i], "lightall", attribs, qtrue, extradefines, qtrue, fallbackShader_lightall_vp, fallbackShader_lightall_fp))
@@ -1139,19 +1213,40 @@ void GLSL_InitGPUShaders(void)
 		numLightShaders++;
 	}
 
-	attribs = ATTR_POSITION | ATTR_POSITION2 | ATTR_NORMAL | ATTR_NORMAL2 | ATTR_TEXCOORD;
-
-	extradefines[0] = '\0';
-
-	if (!GLSL_InitGPUShader(&tr.shadowmapShader, "shadowfill", attribs, qtrue, extradefines, qtrue, fallbackShader_shadowfill_vp, fallbackShader_shadowfill_fp))
+	for (i = 0; i < SHADOWMAPDEF_COUNT; i++)
 	{
-		ri.Error(ERR_FATAL, "Could not load shadowfill shader!");
+		if ((i & SHADOWMAPDEF_USE_VERTEX_ANIMATION) && (i & SHADOWMAPDEF_USE_BONE_ANIMATION))
+			continue;
+
+		if ((i & SHADOWMAPDEF_USE_BONE_ANIMATION) && !glRefConfig.glslMaxAnimatedBones)
+			continue;
+
+		attribs = ATTR_POSITION | ATTR_NORMAL | ATTR_TEXCOORD;
+
+		extradefines[0] = '\0';
+
+		if (i & SHADOWMAPDEF_USE_VERTEX_ANIMATION)
+		{
+			Q_strcat(extradefines, 1024, "#define USE_VERTEX_ANIMATION\n");
+			attribs |= ATTR_POSITION2 | ATTR_NORMAL2;
+		}
+
+		if (i & SHADOWMAPDEF_USE_BONE_ANIMATION)
+		{
+			Q_strcat(extradefines, 1024, va("#define USE_BONE_ANIMATION\n#define MAX_GLSL_BONES %d\n", glRefConfig.glslMaxAnimatedBones));
+			attribs |= ATTR_BONE_INDEXES | ATTR_BONE_WEIGHTS;
+		}
+
+		if (!GLSL_InitGPUShader(&tr.shadowmapShader[i], "shadowfill", attribs, qtrue, extradefines, qtrue, fallbackShader_shadowfill_vp, fallbackShader_shadowfill_fp))
+		{
+			ri.Error(ERR_FATAL, "Could not load shadowfill shader!");
+		}
+
+		GLSL_InitUniforms(&tr.shadowmapShader[i]);
+		GLSL_FinishGPUShader(&tr.shadowmapShader[i]);
+
+		numEtcShaders++;
 	}
-
-	GLSL_InitUniforms(&tr.shadowmapShader);
-	GLSL_FinishGPUShader(&tr.shadowmapShader);
-
-	numEtcShaders++;
 
 	attribs = ATTR_POSITION | ATTR_NORMAL;
 	extradefines[0] = '\0';
@@ -1378,7 +1473,9 @@ void GLSL_ShutdownGPUShaders(void)
 	for ( i = 0; i < LIGHTDEF_COUNT; i++)
 		GLSL_DeleteGPUShader(&tr.lightallShader[i]);
 
-	GLSL_DeleteGPUShader(&tr.shadowmapShader);
+	for ( i = 0; i < SHADOWMAPDEF_COUNT; i++)
+		GLSL_DeleteGPUShader(&tr.shadowmapShader[i]);
+
 	GLSL_DeleteGPUShader(&tr.pshadowShader);
 	GLSL_DeleteGPUShader(&tr.down4xShader);
 	GLSL_DeleteGPUShader(&tr.bokehShader);
@@ -1453,6 +1550,10 @@ shaderProgram_t *GLSL_GetGenericShaderProgram(int stage)
 	if (glState.vertexAnimation)
 	{
 		shaderAttribs |= GENERICDEF_USE_VERTEX_ANIMATION;
+	}
+	else if (glState.boneAnimation)
+	{
+		shaderAttribs |= GENERICDEF_USE_BONE_ANIMATION;
 	}
 
 	if (pStage->bundle[0].numTexMods)
